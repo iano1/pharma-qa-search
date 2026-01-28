@@ -732,9 +732,9 @@ def main():
         # Search section
         st.markdown("### 🔎 Search Query")
         
-        # Initialize query in session state if not present
-        if 'current_query' not in st.session_state:
-            st.session_state.current_query = ""
+        # Initialize example query holder
+        if 'example_to_load' not in st.session_state:
+            st.session_state.example_to_load = ""
         
         # Example questions section
         with st.expander("💡 Example Questions - Click to Use", expanded=False):
@@ -746,46 +746,50 @@ def main():
             
             for tab, category in zip(tabs, tab_names):
                 with tab:
-                    for question in EXAMPLE_QUESTIONS[category]:
-                        # Create a unique key for each button
-                        button_key = f"ex_{category}_{EXAMPLE_QUESTIONS[category].index(question)}"
-                        if st.button(f"🔍 {question}", key=button_key, use_container_width=True):
-                            st.session_state.current_query = question
+                    for idx, question in enumerate(EXAMPLE_QUESTIONS[category]):
+                        button_key = f"ex_{category}_{idx}"
+                        if st.button(question, key=button_key, use_container_width=True):
+                            st.session_state.example_to_load = question
                             st.rerun()
         
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            query = st.text_area(
-                "Enter your query:",
-                value=st.session_state.current_query,
-                placeholder="Example: What is the approved indication for [drug name]?\nExample: What are the side effects?\nExample: Drug interactions with aspirin",
-                height=100,
-                label_visibility="collapsed",
-                key="query_input"
-            )
-            # Update session state when user types
-            if query != st.session_state.current_query:
-                st.session_state.current_query = query
-        
-        with col2:
-            st.markdown("**Search Options**")
-            num_results = st.number_input("Results:", 1, 10, 3, key="num_results")
-            min_score = st.slider("Min Score:", 0.0, 1.0, 0.2, 0.05, key="min_score")
-        
-        # Search button
-        if st.button("🔍 Find Documents", type="primary", use_container_width=True) or \
-           (query and query != st.session_state.last_query):
-            if query.strip():
-                with st.spinner("Searching..."):
-                    results = st.session_state.searcher.search(
-                        query, 
-                        top_k=num_results,
-                        min_score=min_score
-                    )
-                    st.session_state.last_results = results
-                    st.session_state.last_query = query
-            else:
-                st.warning("Please enter a query")
+        # Use form to encapsulate the query input
+        with st.form(key="search_form", clear_on_submit=False):
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                # Use the example if one was selected
+                initial_value = st.session_state.example_to_load
+                query = st.text_area(
+                    "Enter your query:",
+                    value=initial_value,
+                    placeholder="Example: What is the approved indication for [drug name]?\nExample: What are the side effects?",
+                    height=100,
+                    label_visibility="collapsed"
+                )
+                # Clear the example after loading
+                if initial_value:
+                    st.session_state.example_to_load = ""
+            
+            with col2:
+                st.markdown("**Search Options**")
+                num_results = st.number_input("Results:", 1, 10, 3)
+                min_score = st.slider("Min Score:", 0.0, 1.0, 0.2, 0.05)
+            
+            # Submit button for the form
+            submitted = st.form_submit_button("🔍 Find Documents", type="primary", use_container_width=True)
+            
+            if submitted:
+                if query.strip():
+                    with st.spinner("Searching..."):
+                        results = st.session_state.searcher.search(
+                            query, 
+                            top_k=num_results,
+                            min_score=min_score
+                        )
+                        st.session_state.last_results = results
+                        st.session_state.last_query = query
+                else:
+                    st.warning("Please enter a query")
         
         # Display results
         if st.session_state.last_results:
@@ -943,7 +947,7 @@ def main():
                 )
         
         elif st.session_state.last_query:
-            st.info("👆 Click 'Find Documents' to search")
+            st.info("👆 Enter a query and click 'Find Documents' to search")
     
     else:
         # Welcome screen
