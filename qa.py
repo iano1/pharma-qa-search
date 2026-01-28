@@ -732,6 +732,10 @@ def main():
         # Search section
         st.markdown("### 🔎 Search Query")
         
+        # Initialize query in session state if not present
+        if 'current_query' not in st.session_state:
+            st.session_state.current_query = ""
+        
         # Example questions section
         with st.expander("💡 Example Questions - Click to Use", expanded=False):
             st.markdown("**Note:** Replace `[drug name]` with your actual product name")
@@ -746,19 +750,22 @@ def main():
                         # Create a unique key for each button
                         button_key = f"ex_{category}_{EXAMPLE_QUESTIONS[category].index(question)}"
                         if st.button(f"🔍 {question}", key=button_key, use_container_width=True):
-                            st.session_state.last_query = question
+                            st.session_state.current_query = question
                             st.rerun()
         
         col1, col2 = st.columns([3, 1])
         with col1:
             query = st.text_area(
                 "Enter your query:",
-                value=st.session_state.last_query if st.session_state.last_query else "",
+                value=st.session_state.current_query,
                 placeholder="Example: What is the approved indication for [drug name]?\nExample: What are the side effects?\nExample: Drug interactions with aspirin",
                 height=100,
                 label_visibility="collapsed",
                 key="query_input"
             )
+            # Update session state when user types
+            if query != st.session_state.current_query:
+                st.session_state.current_query = query
         
         with col2:
             st.markdown("**Search Options**")
