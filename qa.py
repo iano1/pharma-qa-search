@@ -534,6 +534,111 @@ EXAMPLE_QUESTIONS = {
     ]
 }
 
+# Categorize questions by audience
+HCP_QUESTIONS = {
+    "Indication & Mechanism",
+    "Efficacy & Clinical Data",
+    "Drug Interactions & Monitoring",
+    "Pharmacology"
+}
+
+PATIENT_QUESTIONS = {
+    "Safety & Adverse Events",
+    "Special Populations",
+    "Dosing & Administration",
+    "Practical Information"
+}
+
+# Patient-friendly terms mapping
+PATIENT_FRIENDLY_TERMS = {
+    'adverse events': 'side effects',
+    'adverse event': 'side effect',
+    'contraindications': 'reasons you should not take this',
+    'contraindication': 'reason you should not take this',
+    'pharmacokinetics': 'how the medicine works in your body',
+    'pharmacodynamics': 'how the medicine affects your body',
+    'hepatic': 'liver',
+    'renal': 'kidney',
+    'pediatric': 'children',
+    'efficacy': 'how well it works',
+    'administer': 'take',
+    'administration': 'taking',
+    'dosing regimen': 'how to take it',
+    'drug-drug interaction': 'how it works with other medicines',
+    'drug interaction': 'how it works with other medicines',
+    'monitoring': 'regular check-ups',
+    'metabolism': 'how your body processes it',
+    'therapeutic': 'treatment',
+    'titration': 'dose adjustment',
+    'bioavailability': 'how much medicine gets into your blood',
+    'half-life': 'how long the medicine stays in your body',
+    'clinical trial': 'research study',
+    'clinical endpoint': 'study result',
+    'prophylaxis': 'prevention'
+}
+
+def detect_query_audience(query: str) -> str:
+    """
+    Detect if a query is from an HCP or patient based on language complexity
+    """
+    query_lower = query.lower()
+    
+    # HCP indicators
+    hcp_terms = [
+        'pharmacokinetics', 'pharmacodynamics', 'mechanism of action', 'clinical trial',
+        'efficacy', 'adverse event', 'contraindication', 'drug-drug interaction',
+        'dosing regimen', 'titration', 'monitoring parameters', 'pharmacology',
+        'metabolism', 'hepatic', 'renal', 'pediatric population', 'bioavailability',
+        'half-life', 'therapeutic index', 'clinical endpoint'
+    ]
+    
+    # Patient indicators
+    patient_terms = [
+        'my child', 'my son', 'my daughter', 'i take', 'should i', 'can i',
+        'will it affect', 'is it safe', 'what if i miss', 'how do i',
+        'plain language', 'simple terms', 'easy to understand'
+    ]
+    
+    # Check for explicit audience request
+    if 'patient' in query_lower or 'caregiver' in query_lower or 'parent' in query_lower:
+        return 'patient'
+    if 'hcp' in query_lower or 'healthcare provider' in query_lower or 'physician' in query_lower:
+        return 'hcp'
+    
+    # Count indicators
+    hcp_count = sum(1 for term in hcp_terms if term in query_lower)
+    patient_count = sum(1 for term in patient_terms if term in query_lower)
+    
+    # Detect question style
+    simple_questions = ['what is', 'how do', 'can i', 'should i', 'will it', 'is it safe']
+    has_simple_question = any(q in query_lower for q in simple_questions)
+    
+    # Decision logic
+    if patient_count > 0 or has_simple_question:
+        return 'patient'
+    elif hcp_count >= 2:
+        return 'hcp'
+    else:
+        # Default based on question complexity
+        words = query.split()
+        avg_word_length = sum(len(word) for word in words) / len(words) if words else 0
+        return 'patient' if avg_word_length < 6 else 'hcp'
+
+def simplify_for_patients(text: str) -> str:
+    """
+    Replace medical jargon with patient-friendly language
+    """
+    simplified = text
+    # Sort by length (longest first) to avoid partial replacements
+    sorted_terms = sorted(PATIENT_FRIENDLY_TERMS.items(), key=lambda x: len(x[0]), reverse=True)
+    
+    for medical_term, friendly_term in sorted_terms:
+        # Case-insensitive replacement with word boundaries
+        pattern = re.compile(r'\b' + re.escape(medical_term) + r'\b', re.IGNORECASE)
+        simplified = pattern.sub(friendly_term, simplified)
+    
+    return simplified
+
 def main():
     st.set_page_config(
         page_title="Pharma Q&A Document Finder", 
@@ -552,6 +657,7 @@ def main():
         st.session_state.last_results = []
         st.session_state.last_query = ""
         st.session_state.temp_dir = None
+        st.session_state.forced_audience = None
     
     # Sidebar for configuration
     with st.sidebar:
@@ -746,6 +852,12 @@ def main():
             
             for tab, category in zip(tabs, tab_names):
                 with tab:
+                    # Show audience badge
+                    if category in HCP_QUESTIONS:
+                        st.caption("👨‍⚕️ Healthcare Professional Questions")
+                    elif category in PATIENT_QUESTIONS:
+                        st.caption("🏥 Patient/Caregiver Questions")
+                    
                     for idx, question in enumerate(EXAMPLE_QUESTIONS[category]):
                         button_key = f"ex_{category}_{idx}"
                         if st.button(question, key=button_key, use_container_width=True):
@@ -772,6 +884,14 @@ def main():
             
             with col2:
                 st.markdown("**Search Options**")
+                
+                # Audience selector
+                audience_mode = st.radio(
+                    "Audience:",
+                    ["Auto-detect", "Patient/Caregiver", "Healthcare Professional"],
+                    help="Choose how results should be presented"
+                )
+                
                 num_results = st.number_input("Results:", 1, 10, 3)
                 min_score = st.slider("Min Score:", 0.0, 1.0, 0.2, 0.05)
             
@@ -780,6 +900,14 @@ def main():
             
             if submitted:
                 if query.strip():
+                    # Store audience preference
+                    if audience_mode == "Patient/Caregiver":
+                        st.session_state.forced_audience = 'patient'
+                    elif audience_mode == "Healthcare Professional":
+                        st.session_state.forced_audience = 'hcp'
+                    else:
+                        st.session_state.forced_audience = None
+                        
                     with st.spinner("Searching..."):
                         results = st.session_state.searcher.search(
                             query, 
@@ -795,7 +923,20 @@ def main():
         if st.session_state.last_results:
             results = st.session_state.last_results
             
+            # Detect audience
+            if st.session_state.forced_audience:
+                audience = st.session_state.forced_audience
+            else:
+                audience = detect_query_audience(st.session_state.last_query)
+            
             st.markdown("---")
+            
+            # Show audience indicator
+            if audience == 'patient':
+                st.info("🏥 **Patient/Caregiver Mode**: Results shown in plain language")
+            else:
+                st.info("👨‍⚕️ **Healthcare Professional Mode**: Results shown with medical terminology")
+            
             st.markdown(f"### 📋 Top {len(results)} Most Relevant Documents")
             
             if len(results) == 0:
@@ -839,9 +980,17 @@ def main():
                         num_snippets=3
                     )
                     
+                    # Apply patient-friendly language if needed
+                    if audience == 'patient':
+                        snippets = [simplify_for_patients(snippet) for snippet in snippets]
+                    
                     # Show highlighted snippets
                     if snippets:
-                        st.markdown("**📌 Most Relevant Excerpts:**")
+                        if audience == 'patient':
+                            st.markdown("**📌 Key Information (in plain language):**")
+                        else:
+                            st.markdown("**📌 Most Relevant Excerpts:**")
+                            
                         for snippet_idx, snippet in enumerate(snippets, 1):
                             st.markdown(f"{snippet_idx}. {snippet}", unsafe_allow_html=True)
                             if snippet_idx < len(snippets):
@@ -856,6 +1005,10 @@ def main():
                             max_length=2000
                         )
                         
+                        # Apply patient-friendly language if needed
+                        if audience == 'patient':
+                            highlighted_text = simplify_for_patients(highlighted_text)
+                        
                         st.markdown(highlighted_text, unsafe_allow_html=True)
                         
                         # Show Q&A pairs if detected
@@ -864,8 +1017,10 @@ def main():
                             st.markdown("**Detected Q&A Pairs:**")
                             for q, a in doc.qa_pairs[:5]:  # Show first 5
                                 with st.container():
-                                    st.markdown(f"**Q:** {q}")
-                                    st.markdown(f"**A:** {a[:300]}{'...' if len(a) > 300 else ''}")
+                                    q_display = simplify_for_patients(q) if audience == 'patient' else q
+                                    a_display = simplify_for_patients(a) if audience == 'patient' else a
+                                    st.markdown(f"**Q:** {q_display}")
+                                    st.markdown(f"**A:** {a_display[:300]}{'...' if len(a_display) > 300 else ''}")
                                     st.divider()
                             if len(doc.qa_pairs) > 5:
                                 st.caption(f"+ {len(doc.qa_pairs) - 5} more Q&A pairs")
@@ -914,6 +1069,7 @@ def main():
             with st.expander("📊 Export Search Results"):
                 export_text = f"PHARMA Q&A SEARCH RESULTS\n"
                 export_text += f"Query: {st.session_state.last_query}\n"
+                export_text += f"Audience: {'Patient/Caregiver' if audience == 'patient' else 'Healthcare Professional'}\n"
                 export_text += f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 export_text += f"Results: {len(results)}\n"
                 export_text += "=" * 80 + "\n\n"
@@ -930,6 +1086,11 @@ def main():
                         st.session_state.last_query,
                         num_snippets=3
                     )
+                    
+                    # Apply patient-friendly language
+                    if audience == 'patient':
+                        snippets = [simplify_for_patients(snippet) for snippet in snippets]
+                    
                     if snippets:
                         export_text += f"   Excerpts:\n"
                         for snippet in snippets:
@@ -971,6 +1132,8 @@ def main():
             - 💊 **Medical Domain** - Trained on pharmaceutical literature
             - 🔍 **Enhanced Highlighting** - Catches variations and stems
             - 💡 **Example Questions** - 30+ pre-written HCP and patient questions
+            - 🏥 **Patient Mode** - Auto-simplifies medical jargon for patients
+            - 👨‍⚕️ **HCP Mode** - Preserves medical terminology for professionals
             - ⚡ **Fast** - Optimized for speed
             - 🔒 **100% Local** - No data leaves your machine
             - 📤 **File Upload** - Works with uploaded or local files
@@ -982,28 +1145,27 @@ def main():
             st.markdown("""
             ### 💡 Example Question Categories
             
-            **Indication & Mechanism** (2 questions)
-            - Approved indications and studied populations
-            - Mechanism of action vs. traditional treatments
+            **👨‍⚕️ For Healthcare Professionals:**
+            - Indication & Mechanism (2 questions)
+            - Efficacy & Clinical Data (3 questions)
+            - Drug Interactions & Monitoring (3 questions)
+            - Pharmacology (3 questions)
             
-            **Efficacy & Clinical Data** (3 questions)
-            - Clinical trial support and outcomes
-            - Comparative efficacy vs. standard treatment
+            **🏥 For Patients/Caregivers:**
+            - Safety & Adverse Events (4 questions)
+            - Special Populations (3 questions)
+            - Dosing & Administration (4 questions)
+            - Practical Information (3 questions)
             
-            **Dosing & Administration** (4 questions)
-            - Dosing regimens and considerations
-            - Administration timing and tapering
+            ### 🔄 Language Simplification
             
-            **Safety & Adverse Events** (4 questions)
-            - Common adverse events
-            - Long-term safety profile
-            - Impact on growth and bone health
-            
-            **Drug Interactions & Monitoring** (3 questions)
-            - Known drug-drug interactions
-            - Recommended monitoring
-            
-            **And 5 more categories!** Click "Example Questions" above to explore all 30+ questions.
+            **Patient Mode automatically replaces:**
+            - "adverse events" → "side effects"
+            - "contraindications" → "reasons you should not take this"
+            - "hepatic" → "liver"
+            - "renal" → "kidney"
+            - "efficacy" → "how well it works"
+            - And 15+ more medical terms!
             """)
         
         st.markdown("---")
