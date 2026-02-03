@@ -583,46 +583,77 @@ def detect_query_audience(query: str) -> str:
     """
     query_lower = query.lower()
     
-    # HCP indicators
-    hcp_terms = [
-        'pharmacokinetics', 'pharmacodynamics', 'mechanism of action', 'clinical trial',
-        'efficacy', 'adverse event', 'contraindication', 'drug-drug interaction',
-        'dosing regimen', 'titration', 'monitoring parameters', 'pharmacology',
-        'metabolism', 'hepatic', 'renal', 'pediatric population', 'bioavailability',
-        'half-life', 'therapeutic index', 'clinical endpoint'
+    # Strong HCP indicators (technical medical terms)
+    strong_hcp_terms = [
+        'pharmacokinetics', 'pharmacodynamics', 'mechanism of action', 
+        'bioavailability', 'half-life', 'therapeutic index', 'metabolism',
+        'titration', 'clinical endpoint', 'efficacy outcomes', 'pharmacology',
+        'drug-drug interaction', 'monitoring parameters', 'dosing regimen',
+        'adverse events', 'contraindication', 'hepatic impairment', 'renal impairment'
     ]
     
-    # Patient indicators
-    patient_terms = [
+    # Moderate HCP indicators
+    moderate_hcp_terms = [
+        'clinical trial', 'study', 'trial data', 'evidence', 'efficacy',
+        'clinical data', 'endpoints', 'parameters', 'regimen'
+    ]
+    
+    # Strong patient indicators (personal/direct language)
+    strong_patient_terms = [
         'my child', 'my son', 'my daughter', 'i take', 'should i', 'can i',
-        'will it affect', 'is it safe', 'what if i miss', 'how do i',
-        'plain language', 'simple terms', 'easy to understand'
+        'will it affect me', 'is it safe for me', 'what if i miss', 'how do i take',
+        'my doctor', 'i am taking', 'i have been', 'for my', 'will i'
+    ]
+    
+    # Moderate patient indicators (simple questions)
+    moderate_patient_terms = [
+        'plain language', 'simple terms', 'easy to understand',
+        'side effects', 'safe to take', 'when should i'
     ]
     
     # Check for explicit audience request
-    if 'patient' in query_lower or 'caregiver' in query_lower or 'parent' in query_lower:
+    if any(term in query_lower for term in ['patient-friendly', 'caregiver', 'parent', 'in plain language']):
         return 'patient'
-    if 'hcp' in query_lower or 'healthcare provider' in query_lower or 'physician' in query_lower:
+    if any(term in query_lower for term in ['hcp', 'healthcare provider', 'physician', 'for prescribers']):
         return 'hcp'
     
-    # Count indicators
-    hcp_count = sum(1 for term in hcp_terms if term in query_lower)
-    patient_count = sum(1 for term in patient_terms if term in query_lower)
+    # Count indicators with weights
+    strong_hcp_count = sum(1 for term in strong_hcp_terms if term in query_lower)
+    moderate_hcp_count = sum(1 for term in moderate_hcp_terms if term in query_lower)
+    strong_patient_count = sum(1 for term in strong_patient_terms if term in query_lower)
+    moderate_patient_count = sum(1 for term in moderate_patient_terms if term in query_lower)
     
-    # Detect question style
-    simple_questions = ['what is', 'how do', 'can i', 'should i', 'will it', 'is it safe']
-    has_simple_question = any(q in query_lower for q in simple_questions)
+    # Weight the scores
+    hcp_score = (strong_hcp_count * 3) + moderate_hcp_count
+    patient_score = (strong_patient_count * 3) + moderate_patient_count
     
-    # Decision logic
-    if patient_count > 0 or has_simple_question:
-        return 'patient'
-    elif hcp_count >= 2:
+    # Strong HCP terms always win
+    if strong_hcp_count > 0:
         return 'hcp'
-    else:
-        # Default based on question complexity
-        words = query.split()
-        avg_word_length = sum(len(word) for word in words) / len(words) if words else 0
-        return 'patient' if avg_word_length < 6 else 'hcp'
+    
+    # Strong patient terms always win (if no strong HCP terms)
+    if strong_patient_count > 0:
+        return 'patient'
+    
+    # Compare weighted scores
+    if hcp_score > patient_score:
+        return 'hcp'
+    elif patient_score > hcp_score:
+        return 'patient'
+    
+    # If tied, check question complexity as tiebreaker
+    # Remove common words
+    words = query_lower.split()
+    content_words = [w for w in words if len(w) > 3 and w not in ['what', 'how', 'when', 'where', 'which', 'does', 'this', 'that', 'with', 'from', 'have', 'been']]
+    
+    # Check average word length of content words
+    if content_words:
+        avg_word_length = sum(len(word) for word in content_words) / len(content_words)
+        # Longer average word length suggests HCP (medical terminology tends to be longer)
+        return 'hcp' if avg_word_length >= 7 else 'patient'
+    
+    # Default to patient mode for safety
+    return 'patient'
 
 def simplify_for_patients(text: str) -> str:
     """
