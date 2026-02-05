@@ -743,6 +743,26 @@ def main():
             # File upload section
             st.markdown("**📤 Upload Q&A Documents**")
             
+            # SharePoint tip
+            with st.expander("💡 Uploading from SharePoint/OneDrive?"):
+                st.markdown("""
+                **If you're having trouble uploading SharePoint files:**
+                
+                1. **Download to your computer first:**
+                   - Open the file in SharePoint
+                   - Click "..." menu → Download
+                   - Then upload here
+                
+                2. **Or use batch download:**
+                   - Select all files in SharePoint
+                   - Click Download
+                   - Extract the ZIP
+                   - Upload files from the extracted folder
+                
+                3. **Avoid:** Don't upload directly from SharePoint's "Open in Desktop App" - 
+                   this can cause permission issues.
+                """)
+            
             uploaded_files = st.file_uploader(
                 "Upload Word documents:",
                 type=['docx'],
@@ -762,20 +782,55 @@ def main():
                         # Create new temp directory
                         st.session_state.temp_dir = tempfile.mkdtemp()
                         
-                        # Save uploaded files
-                        for uploaded_file in uploaded_files:
-                            file_path = os.path.join(st.session_state.temp_dir, uploaded_file.name)
-                            with open(file_path, "wb") as f:
-                                f.write(uploaded_file.getbuffer())
+                        # Save uploaded files with better error handling
+                        saved_count = 0
+                        failed_files = []
                         
-                        # Index the documents
-                        with st.spinner("Indexing uploaded documents..."):
-                            num_docs = st.session_state.searcher.index_documents(st.session_state.temp_dir)
-                            if num_docs > 0:
-                                st.session_state.indexed = True
-                                st.success(f"✅ Indexed {num_docs} documents!")
-                            else:
-                                st.error("❌ No documents were processed")
+                        for uploaded_file in uploaded_files:
+                            try:
+                                # Clean filename - remove special characters from SharePoint
+                                clean_filename = uploaded_file.name
+                                # Remove common SharePoint metadata patterns
+                                clean_filename = re.sub(r'[<>:"|?*]', '', clean_filename)
+                                # Remove any path separators
+                                clean_filename = os.path.basename(clean_filename)
+                                # Limit filename length
+                                if len(clean_filename) > 200:
+                                    name, ext = os.path.splitext(clean_filename)
+                                    clean_filename = name[:196] + ext
+                                
+                                file_path = os.path.join(st.session_state.temp_dir, clean_filename)
+                                
+                                # Write file in binary mode
+                                with open(file_path, "wb") as f:
+                                    # Get bytes and write
+                                    file_bytes = uploaded_file.getbuffer()
+                                    f.write(file_bytes)
+                                
+                                saved_count += 1
+                            except Exception as e:
+                                failed_files.append((uploaded_file.name, str(e)))
+                        
+                        # Show summary
+                        if failed_files:
+                            st.warning(f"⚠️ {len(failed_files)} file(s) failed to upload")
+                            with st.expander("View failed files"):
+                                for fname, error in failed_files:
+                                    st.error(f"**{fname}**: {error}")
+                        
+                        if saved_count > 0:
+                            st.success(f"✅ Saved {saved_count} files")
+                            
+                            # Index the documents
+                            with st.spinner("Indexing uploaded documents..."):
+                                num_docs = st.session_state.searcher.index_documents(st.session_state.temp_dir)
+                                if num_docs > 0:
+                                    st.session_state.indexed = True
+                                    st.success(f"✅ Indexed {num_docs} documents!")
+                                else:
+                                    st.error("❌ No documents were processed")
+                        else:
+                            st.error("❌ No files could be saved")
                 else:
                     st.warning("⚠️ Please load a model first")
         
