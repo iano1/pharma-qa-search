@@ -14,6 +14,21 @@ import shutil
 from collections import Counter
 
 # ============================================================================
+# DOCUMENT CLASS (must be defined before detector classes)
+# ============================================================================
+
+class QADocument:
+    """Represents a Q&A document"""
+    def __init__(self, filename, full_text, file_path, file_modified_date, word_count, title="", qa_pairs=None):
+        self.filename = filename
+        self.full_text = full_text
+        self.file_path = file_path
+        self.file_modified_date = file_modified_date
+        self.word_count = word_count
+        self.title = title  # Document title
+        self.qa_pairs = qa_pairs if qa_pairs is not None else []
+
+# ============================================================================
 # PRODUCT NAME DETECTION CONFIGURATION
 # ============================================================================
 
@@ -244,17 +259,6 @@ def extract_filename_keywords(filename: str) -> List[str]:
             keywords.append(word_clean)
     
     return keywords
-
-class QADocument:
-    """Represents a Q&A document"""
-    def __init__(self, filename, full_text, file_path, file_modified_date, word_count, title="", qa_pairs=None):
-        self.filename = filename
-        self.full_text = full_text
-        self.file_path = file_path
-        self.file_modified_date = file_modified_date
-        self.word_count = word_count
-        self.title = title  # Document title
-        self.qa_pairs = qa_pairs if qa_pairs is not None else []
 
 class PharmaQASearcher:
     def __init__(self, model_name: str = 'pritamdeka/S-PubMedBert-MS-MARCO'):
@@ -1920,3 +1924,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
