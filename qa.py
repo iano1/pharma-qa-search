@@ -894,30 +894,41 @@ class PharmaQASearcher:
                 # Count how many times product appears in this doc
                 product_count = doc_text_lower.count(found_product.lower())
                 
-                # Calculate penalty based on product name frequency
-                # Docs with 10+ mentions get penalized (likely match on product, not content)
+                # STRONGER PENALTY: Calculate based on product name frequency
+                # Docs with 10+ mentions get progressively penalized (DOUBLED penalties)
                 if product_count > 10:
-                    # Progressive penalty: 
-                    # 11-20 mentions: -2% to -4%
-                    # 21-30 mentions: -4% to -6%
-                    # 30+ mentions: -6% to -8% (max)
-                    penalty_factor = min(0.08, (product_count - 10) * 0.002)
+                    # Progressive penalty (INCREASED from 0.002 to 0.004):
+                    # 11-20 mentions: -4% to -8%
+                    # 21-30 mentions: -8% to -12%
+                    # 30+ mentions: -12% to -16% (DOUBLED max penalty)
+                    penalty_factor = min(0.16, (product_count - 10) * 0.004)
                     adjusted_score = score * (1 - penalty_factor)
                     
-                # ADDITIONAL: If this doc scores high but has few non-product terms from query
-                # (i.e., it matches mainly on product name), penalize more
+                # ADDITIONAL: Check if doc matches on content terms (not just product name)
                 query_terms = expanded_query.lower().split()
-                # Remove product name from query terms
-                content_terms = [t for t in query_terms if found_product not in t and len(t) > 3]
+                # Remove product name and common words from query terms
+                content_terms = [
+                    t for t in query_terms 
+                    if found_product not in t 
+                    and len(t) > 3
+                    and t not in ['what', 'does', 'have', 'with', 'from', 'this', 'that', 'there']
+                ]
                 
                 if content_terms:
                     # Check how many content terms appear in doc
                     content_matches = sum(1 for term in content_terms if term in doc_text_lower)
                     content_ratio = content_matches / len(content_terms)
                     
-                    # If less than 30% of content terms match, this doc likely matches on product only
-                    if content_ratio < 0.3:
-                        adjusted_score = adjusted_score * 0.95  # Additional 5% penalty
+                    # STRONGER content penalty (INCREASED threshold from 0.3 to 0.5):
+                    # If less than 50% of content terms match, doc likely matches on product only
+                    if content_ratio < 0.5:
+                        # INCREASED penalty from 5% to 10%
+                        adjusted_score = adjusted_score * 0.90
+                    
+                    # NEW: BOOST for strong content matches (>75% of terms match)
+                    # This helps the CORRECT document win
+                    elif content_ratio > 0.75:
+                        adjusted_score = adjusted_score * 1.03  # 3% boost for strong content match
             
             if adjusted_score >= min_score:
                 results.append((self.documents[idx], float(adjusted_score)))
