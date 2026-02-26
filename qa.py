@@ -890,45 +890,64 @@ class PharmaQASearcher:
             if found_product and score >= min_score:
                 doc = self.documents[idx]
                 doc_text_lower = doc.full_text.lower()
+                doc_title_lower = doc.title.lower()
                 
                 # Count how many times product appears in this doc
                 product_count = doc_text_lower.count(found_product.lower())
                 
-                # STRONGER PENALTY: Calculate based on product name frequency
-                # Docs with 10+ mentions get progressively penalized (DOUBLED penalties)
-                if product_count > 10:
-                    # Progressive penalty (INCREASED from 0.002 to 0.004):
-                    # 11-20 mentions: -4% to -8%
-                    # 21-30 mentions: -8% to -12%
-                    # 30+ mentions: -12% to -16% (DOUBLED max penalty)
-                    penalty_factor = min(0.16, (product_count - 10) * 0.004)
-                    adjusted_score = score * (1 - penalty_factor)
-                    
-                # ADDITIONAL: Check if doc matches on content terms (not just product name)
+                # CRITICAL: Check if doc matches on content terms (not just product name)
                 query_terms = expanded_query.lower().split()
                 # Remove product name and common words from query terms
                 content_terms = [
                     t for t in query_terms 
                     if found_product not in t 
                     and len(t) > 3
-                    and t not in ['what', 'does', 'have', 'with', 'from', 'this', 'that', 'there']
+                    and t not in ['what', 'does', 'have', 'with', 'from', 'this', 'that', 'there', 'are', 'the', 'and']
                 ]
                 
+                # Calculate content match ratio
+                content_ratio = 0.0
                 if content_terms:
-                    # Check how many content terms appear in doc
+                    # Check how many content terms appear in doc (body + title)
                     content_matches = sum(1 for term in content_terms if term in doc_text_lower)
-                    content_ratio = content_matches / len(content_terms)
                     
-                    # STRONGER content penalty (INCREASED threshold from 0.3 to 0.5):
-                    # If less than 50% of content terms match, doc likely matches on product only
-                    if content_ratio < 0.5:
-                        # INCREASED penalty from 5% to 10%
-                        adjusted_score = adjusted_score * 0.90
+                    # BOOST: Check if content terms appear in TITLE or FILENAME (very strong signal)
+                    title_matches = sum(1 for term in content_terms if term in doc_title_lower)
+                    filename_lower = doc.filename.lower()
+                    filename_matches = sum(1 for term in content_terms if term in filename_lower)
                     
-                    # NEW: BOOST for strong content matches (>75% of terms match)
-                    # This helps the CORRECT document win
-                    elif content_ratio > 0.75:
-                        adjusted_score = adjusted_score * 1.03  # 3% boost for strong content match
+                    # Weight title/filename matches more heavily
+                    weighted_matches = content_matches + (title_matches * 2) + (filename_matches * 2)
+                    content_ratio = min(1.0, weighted_matches / len(content_terms))
+                
+                # MAXIMUM AGGRESSIVE PENALTY for low content match:
+                if content_ratio < 0.5:
+                    # Document matches on product name only, NOT on actual content
+                    # MASSIVE -30% penalty (tripled from -10%)
+                    adjusted_score = adjusted_score * 0.70
+                    
+                elif content_ratio < 0.7:
+                    # Weak content match - still penalize
+                    # -15% penalty
+                    adjusted_score = adjusted_score * 0.85
+                
+                # BOOST for EXCELLENT content matches (helps correct document)
+                elif content_ratio > 1.5:  # Title + filename + body all match
+                    # STRONG +8% boost (was +5%)
+                    adjusted_score = adjusted_score * 1.08
+                    
+                elif content_ratio > 1.0:  # Title or filename match + body
+                    # GOOD +5% boost
+                    adjusted_score = adjusted_score * 1.05
+                
+                # ADDITIONAL: Product frequency penalty (applies on top)
+                if product_count > 10:
+                    # EXTREME penalty for product name spam:
+                    # 11-20 mentions: -12% to -24%
+                    # 21-30 mentions: -24% to -36%
+                    # 30+ mentions: -36% to -50% (CRUSHING penalty)
+                    penalty_factor = min(0.50, (product_count - 10) * 0.012)
+                    adjusted_score = adjusted_score * (1 - penalty_factor)
             
             if adjusted_score >= min_score:
                 results.append((self.documents[idx], float(adjusted_score)))
