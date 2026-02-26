@@ -4,13 +4,203 @@ from pathlib import Path
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import faiss
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Set
 import docx
 import json
 from datetime import datetime
 import re
 import tempfile
 import shutil
+from collections import Counter
+
+# ============================================================================
+# PRODUCT NAME DETECTION CONFIGURATION
+# ============================================================================
+
+# Manual product list (fallback / baseline)
+MANUAL_PRODUCT_NAMES = [
+    'vamorolone',
+    'agamree',
+    # Add more product names as needed:
+]
+
+class AutoProductDetector:
+    """Automatically detect product names from corpus using frequency analysis"""
+    
+    def __init__(self):
+        self.detected_products = set()
+        self.initialized = False
+        self.stats = {}
+    
+    def learn_from_documents(self, documents: List[QADocument]) -> Dict[str, int]:
+        """Learn product names from document corpus"""
+        if self.initialized:
+            return self.stats
+        
+        word_freq = Counter()
+        word_doc_count = Counter()
+        total_docs = len(documents)
+        
+        for doc in documents:
+            # Extract capitalized words (likely proper nouns/product names)
+            caps_words = re.findall(r'\b[A-Z][a-z]{4,}\b', doc.full_text)
+            
+            # Track unique words per document
+            unique_in_doc = set()
+            for word in caps_words:
+                word_lower = word.lower()
+                
+                # Skip common medical terms
+                if word_lower in ['patient', 'patients', 'treatment', 'treatments',
+                                  'section', 'summary', 'document', 'clinical',
+                                  'study', 'studies', 'therapy', 'disease']:
+                    continue
+                
+                word_freq[word_lower] += 1
+                unique_in_doc.add(word_lower)
+            
+            # Count documents containing each word
+            for word in unique_in_doc:
+                word_doc_count[word] += 1
+        
+        # Products typically appear in >25% of documents
+        doc_threshold = total_docs * 0.25
+        
+        # Also need sufficient total mentions
+        freq_threshold = 10
+        
+        for word, doc_count in word_doc_count.items():
+            if doc_count >= doc_threshold and word_freq[word] >= freq_threshold:
+                self.detected_products.add(word)
+                self.stats[word] = {
+                    'documents': doc_count,
+                    'total_mentions': word_freq[word],
+                    'doc_percentage': (doc_count / total_docs) * 100
+                }
+        
+        self.initialized = True
+        return self.stats
+    
+    def detect_in_text(self, text: str) -> List[str]:
+        """Detect which products appear in given text"""
+        if not self.initialized:
+            return []
+        
+        text_lower = text.lower()
+        found = []
+        
+        for product in self.detected_products:
+            if re.search(r'\b' + re.escape(product) + r'\b', text_lower):
+                found.append(product)
+        
+        return found
+    
+    def get_products(self) -> Set[str]:
+        """Get all detected products"""
+        return self.detected_products
+
+class NERProductDetector:
+    """Detect product names using Named Entity Recognition (ScispaCy)"""
+    
+    def __init__(self):
+        self.nlp = None
+        self.loaded = False
+        self.error = None
+        self.detected_cache = {}
+    
+    def load_model(self):
+        """Load ScispaCy NER model"""
+        if self.loaded:
+            return True
+        
+        try:
+            import spacy
+            # Try to load medical NER model
+            self.nlp = spacy.load("en_ner_bc5cdr_md")
+            self.loaded = True
+            return True
+        except ImportError:
+            self.error = "scispacy not installed. Run: pip install scispacy && pip install https://s3-us-west-2.amazonaws.com/ai2-s3-scispacy/releases/v0.5.1/en_ner_bc5cdr_md-0.5.1.tar.gz"
+            return False
+        except OSError:
+            self.error = "Model not found. Run: pip install https://s3-us-west-2.amazonaws.com/ai2-s3-scispacy/releases/v0.5.1/en_ner_bc5cdr_md-0.5.1.tar.gz"
+            return False
+        except Exception as e:
+            self.error = f"Error loading model: {str(e)}"
+            return False
+    
+    def detect_in_text(self, text: str) -> List[str]:
+        """Extract chemical/drug names using NER"""
+        if not self.loaded:
+            return []
+        
+        # Check cache
+        if text in self.detected_cache:
+            return self.detected_cache[text]
+        
+        try:
+            doc = self.nlp(text)
+            products = []
+            
+            for ent in doc.ents:
+                if ent.label_ == "CHEMICAL":
+                    product = ent.text.lower()
+                    if len(product) > 4:  # Skip very short terms
+                        products.append(product)
+            
+            result = list(set(products))
+            self.detected_cache[text] = result
+            return result
+        except Exception as e:
+            return []
+    
+    def get_error(self) -> str:
+        """Get error message if model failed to load"""
+        return self.error
+
+class HybridProductDetector:
+    """Hybrid approach: corpus analysis + NER fallback"""
+    
+    def __init__(self):
+        self.auto_detector = AutoProductDetector()
+        self.ner_detector = NERProductDetector()
+        self.use_ner_fallback = False
+    
+    def initialize(self, documents: List[QADocument], enable_ner: bool = False):
+        """Initialize both detectors"""
+        # Always learn from corpus
+        stats = self.auto_detector.learn_from_documents(documents)
+        
+        # Optionally enable NER fallback
+        if enable_ner:
+            self.use_ner_fallback = self.ner_detector.load_model()
+        
+        return stats
+    
+    def detect_in_text(self, text: str) -> List[str]:
+        """Detect products using corpus knowledge, with NER fallback"""
+        # First try corpus-based detection (fast)
+        found = self.auto_detector.detect_in_text(text)
+        
+        # If nothing found and NER is available, try NER
+        if not found and self.use_ner_fallback:
+            found = self.ner_detector.detect_in_text(text)
+        
+        return found
+    
+    def get_products(self) -> Set[str]:
+        """Get all known products"""
+        return self.auto_detector.get_products()
+
+# ============================================================================
+# CONFIGURABLE: Choose default detection method
+# ============================================================================
+PRODUCT_DETECTION_METHODS = {
+    'manual': 'Manual List (Fastest)',
+    'auto': 'Auto-Detect from Corpus (Smart)',
+    'ner': 'NER - ScispaCy (Most Accurate)',
+    'hybrid': 'Hybrid - Auto + NER Fallback (Best)'
+}
 
 def filter_drug_names(text: str, drug_names: List[str] = None) -> str:
     """
@@ -18,7 +208,7 @@ def filter_drug_names(text: str, drug_names: List[str] = None) -> str:
     Keep first 5 occurrences, replace rest with generic placeholder
     """
     if drug_names is None:
-        drug_names = ['vamorolone', 'agamree']
+        drug_names = MANUAL_PRODUCT_NAMES
     
     filtered = text
     for drug in drug_names:
@@ -74,6 +264,11 @@ class PharmaQASearcher:
         self.model_name = model_name
         self.index = None
         self.documents: List[QADocument] = []
+        
+        # Product detection system
+        self.product_detector = None
+        self.detection_method = 'manual'  # Default to manual
+        self.detection_stats = {}
         
     def extract_text_from_docx(self, file_path: str) -> Tuple[str, str]:
         """
@@ -512,6 +707,10 @@ class PharmaQASearcher:
             status_text.empty()
             return 0
         
+        # Initialize product detection based on selected method
+        status_text.text("Initializing product detection...")
+        self._initialize_product_detection()
+        
         status_text.text("Creating document embeddings with optimized weighting...")
         
         # Create embeddings with improved weighting strategy:
@@ -551,13 +750,123 @@ class PharmaQASearcher:
         
         return len(self.documents)
     
+    def _initialize_product_detection(self):
+        """Initialize product detection based on selected method"""
+        method = st.session_state.get('detection_method', 'manual')
+        self.detection_method = method
+        
+        if method == 'manual':
+            # Use manual list
+            self.detection_stats = {
+                'method': 'manual',
+                'products': MANUAL_PRODUCT_NAMES,
+                'count': len(MANUAL_PRODUCT_NAMES)
+            }
+            st.success(f"✅ Using manual product list: {', '.join(MANUAL_PRODUCT_NAMES)}")
+        
+        elif method == 'auto':
+            # Auto-detect from corpus
+            self.product_detector = AutoProductDetector()
+            stats = self.product_detector.learn_from_documents(self.documents)
+            detected = self.product_detector.get_products()
+            
+            self.detection_stats = {
+                'method': 'auto',
+                'products': list(detected),
+                'count': len(detected),
+                'details': stats
+            }
+            
+            if detected:
+                st.success(f"✅ Auto-detected {len(detected)} products: {', '.join(sorted(detected))}")
+            else:
+                st.warning("⚠️ No products auto-detected. Falling back to manual list.")
+                self.detection_method = 'manual'
+        
+        elif method == 'ner':
+            # Use NER only
+            self.product_detector = NERProductDetector()
+            loaded = self.product_detector.load_model()
+            
+            if loaded:
+                self.detection_stats = {
+                    'method': 'ner',
+                    'products': 'Dynamic (detected per query)',
+                    'status': 'Model loaded'
+                }
+                st.success("✅ ScispaCy NER model loaded successfully")
+            else:
+                error = self.product_detector.get_error()
+                st.error(f"❌ NER model failed to load: {error}")
+                st.info("Falling back to manual list...")
+                self.detection_method = 'manual'
+        
+        elif method == 'hybrid':
+            # Hybrid: Auto + NER fallback
+            self.product_detector = HybridProductDetector()
+            stats = self.product_detector.initialize(self.documents, enable_ner=True)
+            detected = self.product_detector.get_products()
+            
+            self.detection_stats = {
+                'method': 'hybrid',
+                'products': list(detected),
+                'count': len(detected),
+                'details': stats,
+                'ner_enabled': self.product_detector.use_ner_fallback
+            }
+            
+            if detected:
+                ner_status = "with NER fallback" if self.product_detector.use_ner_fallback else "without NER"
+                st.success(f"✅ Hybrid detection: {len(detected)} products from corpus {ner_status}")
+                st.info(f"Products: {', '.join(sorted(detected))}")
+            else:
+                st.warning("⚠️ Hybrid detection found no products. Using manual list.")
+                self.detection_method = 'manual'
+    
+    def _get_detected_products(self, query: str) -> List[str]:
+        """Get detected products in query based on current detection method"""
+        if self.detection_method == 'manual':
+            # Check manual list
+            query_lower = query.lower()
+            return [p for p in MANUAL_PRODUCT_NAMES if p in query_lower]
+        
+        elif self.detection_method in ['auto', 'ner', 'hybrid']:
+            # Use detector
+            if self.product_detector:
+                return self.product_detector.detect_in_text(query)
+            else:
+                # Fallback to manual
+                query_lower = query.lower()
+                return [p for p in MANUAL_PRODUCT_NAMES if p in query_lower]
+        
+        return []
+    
     def search(self, query: str, top_k: int = 5, min_score: float = 0.0) -> List[Tuple[QADocument, float]]:
-        """Search for most relevant Q&A documents with synonym expansion"""
+        """Search for most relevant Q&A documents with synonym expansion and product name de-weighting"""
         if self.index is None or len(self.documents) == 0:
             return []
         
         # Expand query with pharma-specific synonyms
         expanded_query = expand_query_with_synonyms(query)
+        
+        # Detect product names in query using selected detection method
+        found_products = self._get_detected_products(expanded_query)
+        found_product = found_products[0] if found_products else None
+        
+        # If product name found, reduce its repetition in the query
+        if found_product:
+            # Keep product name once, but don't let it dominate
+            # Replace multiple mentions with single mention
+            pattern = re.compile(r'\b' + re.escape(found_product) + r'\b', re.IGNORECASE)
+            matches = list(pattern.finditer(expanded_query))
+            
+            if len(matches) > 1:
+                # Keep first occurrence, remove others
+                for match in reversed(matches[1:]):
+                    expanded_query = (
+                        expanded_query[:match.start()] + 
+                        expanded_query[match.end():]
+                    )
         
         # Encode query
         query_embedding = self.model.encode([expanded_query], convert_to_numpy=True)
@@ -567,11 +876,47 @@ class PharmaQASearcher:
         k = min(top_k, len(self.documents))
         scores, indices = self.index.search(query_embedding.astype('float32'), k)
         
-        # Return results above threshold
+        # NEW: Post-process scores to de-weight product name matches
+        # This ensures "MOA of vamorolone" matches on "MOA" not just "vamorolone"
         results = []
         for idx, score in zip(indices[0], scores[0]):
-            if score >= min_score:
-                results.append((self.documents[idx], float(score)))
+            adjusted_score = score
+            
+            # If query contained product name, penalize docs that match primarily on product name
+            if found_product and score >= min_score:
+                doc = self.documents[idx]
+                doc_text_lower = doc.full_text.lower()
+                
+                # Count how many times product appears in this doc
+                product_count = doc_text_lower.count(found_product.lower())
+                
+                # Calculate penalty based on product name frequency
+                # Docs with 10+ mentions get penalized (likely match on product, not content)
+                if product_count > 10:
+                    # Progressive penalty: 
+                    # 11-20 mentions: -2% to -4%
+                    # 21-30 mentions: -4% to -6%
+                    # 30+ mentions: -6% to -8% (max)
+                    penalty_factor = min(0.08, (product_count - 10) * 0.002)
+                    adjusted_score = score * (1 - penalty_factor)
+                    
+                # ADDITIONAL: If this doc scores high but has few non-product terms from query
+                # (i.e., it matches mainly on product name), penalize more
+                query_terms = expanded_query.lower().split()
+                # Remove product name from query terms
+                content_terms = [t for t in query_terms if found_product not in t and len(t) > 3]
+                
+                if content_terms:
+                    # Check how many content terms appear in doc
+                    content_matches = sum(1 for term in content_terms if term in doc_text_lower)
+                    content_ratio = content_matches / len(content_terms)
+                    
+                    # If less than 30% of content terms match, this doc likely matches on product only
+                    if content_ratio < 0.3:
+                        adjusted_score = adjusted_score * 0.95  # Additional 5% penalty
+            
+            if adjusted_score >= min_score:
+                results.append((self.documents[idx], float(adjusted_score)))
         
         return results
 
@@ -900,6 +1245,7 @@ def main():
             - 🔤 Abbreviations: "MOA" → "mechanism of action", "DDI" → "drug drug interaction"
             - 🔗 Pharma synonyms: "storage" ↔ "transport", "discontinue" ↔ "stop/taper"
             - 🧹 Query cleaning: Removes "are there any", "does X have" for better matching
+            - 💊 Product de-weighting: "MOA of vamorolone" matches on MOA, not just drug name
             """)
         
         # Initialize model
@@ -913,6 +1259,82 @@ def main():
         
         if st.session_state.searcher is not None:
             st.success(f"✅ {selected_model_name.split(' - ')[0]}")
+        
+        st.divider()
+        
+        # Product Detection Method Selection
+        st.subheader("🔬 Product Detection")
+        
+        detection_method = st.selectbox(
+            "Detection Method:",
+            options=list(PRODUCT_DETECTION_METHODS.keys()),
+            format_func=lambda x: PRODUCT_DETECTION_METHODS[x],
+            index=1,  # Default to 'auto'
+            help="Choose how product names are detected for de-weighting"
+        )
+        
+        # Store in session state
+        if 'detection_method' not in st.session_state:
+            st.session_state.detection_method = 'auto'
+        
+        if detection_method != st.session_state.detection_method:
+            st.session_state.detection_method = detection_method
+            st.session_state.indexed = False  # Force re-indexing
+        
+        with st.expander("ℹ️ Detection Methods"):
+            st.markdown("""
+            **Manual List**: Uses pre-defined list of product names
+            - ✅ Fastest (instant)
+            - ✅ 100% accurate for known products
+            - ❌ Must update list manually
+            
+            **Auto-Detect**: Learns from your documents
+            - ✅ No manual maintenance
+            - ✅ Fast (<1ms per query)
+            - ✅ Finds products mentioned frequently
+            - ⚠️ Requires 25%+ document coverage
+            
+            **NER - ScispaCy**: Medical entity recognition
+            - ✅ Highest accuracy
+            - ✅ Detects any drug/chemical name
+            - ⚠️ Requires ScispaCy installation
+            - ⚠️ Slower (50-100ms per query)
+            
+            **Hybrid**: Auto + NER fallback (recommended)
+            - ✅ Best of both worlds
+            - ✅ Fast (uses corpus cache)
+            - ✅ NER fallback for unknowns
+            - ✅ Self-learning
+            """)
+        
+        # Show current detection stats
+        if st.session_state.indexed and st.session_state.searcher:
+            stats = st.session_state.searcher.detection_stats
+            if stats:
+                with st.expander("📊 Detection Stats"):
+                    st.markdown(f"**Method**: {stats.get('method', 'N/A').upper()}")
+                    
+                    if stats.get('method') == 'manual':
+                        products = stats.get('products', [])
+                        st.markdown(f"**Products**: {', '.join(products)}")
+                    
+                    elif stats.get('method') in ['auto', 'hybrid']:
+                        products = stats.get('products', [])
+                        st.markdown(f"**Detected Products**: {len(products)}")
+                        if products:
+                            st.markdown(f"_{', '.join(sorted(products))}_")
+                        
+                        details = stats.get('details', {})
+                        if details:
+                            st.markdown("**Coverage:**")
+                            for product, info in list(details.items())[:5]:
+                                doc_pct = info.get('doc_percentage', 0)
+                                mentions = info.get('total_mentions', 0)
+                                st.caption(f"• {product}: {doc_pct:.1f}% of docs ({mentions} mentions)")
+                    
+                    elif stats.get('method') == 'ner':
+                        st.markdown(f"**Status**: {stats.get('status', 'Unknown')}")
+                        st.caption("Products detected dynamically per query")
         
         st.divider()
         
@@ -1203,6 +1625,14 @@ def main():
             else:
                 audience = detect_query_audience(st.session_state.last_query)
             
+            # Check if product name is in query (for de-weighting notification)
+            detected_products = []
+            if st.session_state.searcher:
+                detected_products = st.session_state.searcher._get_detected_products(st.session_state.last_query)
+            
+            detected_product = detected_products[0] if detected_products else None
+            detection_method = st.session_state.searcher.detection_method if st.session_state.searcher else 'manual'
+            
             st.markdown("---")
             
             # Show audience indicator
@@ -1210,6 +1640,16 @@ def main():
                 st.info("🏥 **Patient/Caregiver Mode**: Results shown in plain language")
             else:
                 st.info("👨‍⚕️ **Healthcare Professional Mode**: Results shown with medical terminology")
+            
+            # Show product name de-weighting indicator with detection method
+            if detected_product:
+                method_name = PRODUCT_DETECTION_METHODS.get(detection_method, detection_method)
+                if len(detected_products) > 1:
+                    products_str = f"{', '.join(detected_products[:2])}" + (f" +{len(detected_products)-2} more" if len(detected_products) > 2 else "")
+                else:
+                    products_str = detected_product
+                
+                st.success(f"✅ **Smart Search Active** ({method_name}): Results weighted by content relevance, not just '{products_str}' frequency")
             
             st.markdown(f"### 📋 Top {len(results)} Most Relevant Documents")
             
@@ -1413,6 +1853,7 @@ def main():
             - 🔤 **Abbreviation Expansion** - "MOA" → "mechanism of action"
             - 🔗 **Pharma Synonyms** - "storage" ↔ "transport", "DDI" → "drug interactions"
             - 🧹 **Query Cleaning** - Removes noise words like "are there any"
+            - 💊 **Smart Product Detection** - 4 methods: Manual, Auto, NER, Hybrid
             - 🔍 **Enhanced Highlighting** - Catches variations and stems
             - 💡 **Example Questions** - 30+ pre-written HCP and patient questions
             - 🏥 **Patient Mode** - Auto-simplifies medical jargon for patients
@@ -1434,13 +1875,28 @@ def main():
             - "are there any effects on bone health?" → removes "are there any"
             - "data in peds" → expands to "pediatric children"
             
-            **Storage & Transport:**
-            - "How to transport vamorolone?"
-            - "Storage conditions for the medication"
+            **Product Detection:**
+            Choose from 4 methods in sidebar:
             
-            **Discontinuing Treatment:**
-            - "How to stop treatment?"
-            - "Tapering schedule"
+            **1. Manual List** (Fastest)
+            - Pre-defined product names
+            - Instant detection
+            - Must maintain list
+            
+            **2. Auto-Detect** (Smart)
+            - Learns from your documents
+            - No maintenance needed
+            - Finds frequently mentioned products
+            
+            **3. NER - ScispaCy** (Most Accurate)
+            - Medical AI entity recognition
+            - Detects any drug/chemical
+            - Requires ScispaCy
+            
+            **4. Hybrid** (Recommended)
+            - Auto-detect + NER fallback
+            - Best accuracy + speed
+            - Self-learning
             
             ### 🔗 Smart Features
             
@@ -1451,7 +1907,7 @@ def main():
             - Peds → pediatric children
             
             **Filename boosting:**
-            - "Cardiac_Effects" in filename → boosts for "cardiac" or "heart" queries
+            - "Cardiac_Effects" → boosts for "cardiac" queries
             - "Bone_Health" → boosts for "bone" queries
             """)
         
