@@ -12,14 +12,58 @@ import re
 import tempfile
 import shutil
 
+def filter_drug_names(text: str, drug_names: List[str] = None) -> str:
+    """
+    Reduce frequency of drug name in text to avoid over-weighting
+    Keep first 5 occurrences, replace rest with generic placeholder
+    """
+    if drug_names is None:
+        drug_names = ['vamorolone', 'agamree']
+    
+    filtered = text
+    for drug in drug_names:
+        # Find all occurrences
+        occurrences = list(re.finditer(r'\b' + re.escape(drug) + r'\b', filtered, re.IGNORECASE))
+        # If more than 5 occurrences, replace extras
+        if len(occurrences) > 5:
+            for match in reversed(occurrences[5:]):
+                # Replace with generic placeholder
+                filtered = filtered[:match.start()] + '[MEDICATION]' + filtered[match.end():]
+    
+    return filtered
+
+def extract_filename_keywords(filename: str) -> List[str]:
+    """Extract meaningful keywords from filename for boosting"""
+    # Remove extension
+    name = Path(filename).stem
+    
+    # Remove common patterns: SRL numbers, versions, regions
+    name = re.sub(r'SRL_?\d+_?', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'_v?F?\d+[\._]\d+', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'_EU\b', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'_US\b', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'_FINAL\b', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'\b(VAM|MT)\b', '', name, flags=re.IGNORECASE)
+    
+    # Split on underscores, dashes, and extract words
+    keywords = []
+    for word in re.split(r'[_\-\s]+', name):
+        word_clean = word.strip()
+        # Keep meaningful words (length > 2)
+        if len(word_clean) > 2:
+            keywords.append(word_clean)
+    
+    return keywords
+
 class QADocument:
     """Represents a Q&A document"""
-    def __init__(self, filename, full_text, file_path, file_modified_date, word_count, qa_pairs=None):
+    def __init__(self, filename, full_text, file_path, file_modified_date, word_count, title="", qa_pairs=None):
         self.filename = filename
         self.full_text = full_text
         self.file_path = file_path
         self.file_modified_date = file_modified_date
         self.word_count = word_count
+        self.title = title  # Document title
         self.qa_pairs = qa_pairs if qa_pairs is not None else []
 
 class PharmaQASearcher:
@@ -31,13 +75,44 @@ class PharmaQASearcher:
         self.index = None
         self.documents: List[QADocument] = []
         
-    def extract_text_from_docx(self, file_path: str) -> str:
-        """Extract all text from a Word document"""
+    def extract_text_from_docx(self, file_path: str) -> Tuple[str, str]:
+        """
+        Extract all text from a Word document
+        Returns: (title, body_text)
+        """
         try:
             doc = docx.Document(file_path)
             text_parts = []
+            title = ""
             
-            # Get paragraph text
+            # Extract title from first bold paragraphs
+            # Skip generic product name (first bold line), use second bold line as title
+            bold_paragraphs = []
+            for i, para in enumerate(doc.paragraphs[:5]):
+                text = para.text.strip()
+                if text:
+                    # Check if paragraph is bold
+                    is_bold = any(run.bold for run in para.runs if run.text.strip())
+                    if is_bold and len(text) < 200:
+                        bold_paragraphs.append(text)
+            
+            # Use second bold paragraph as title (skip first which is often product name)
+            if len(bold_paragraphs) >= 2:
+                title = bold_paragraphs[1]  # Skip first bold line (product name)
+            elif len(bold_paragraphs) == 1:
+                # If only one bold paragraph, check if it looks like a product name
+                # (short, all caps, or very generic)
+                text = bold_paragraphs[0]
+                if len(text) > 30 or not text.isupper():
+                    title = text
+                else:
+                    # Likely just product name, use filename instead
+                    title = Path(file_path).stem
+            else:
+                # Fallback: use filename
+                title = Path(file_path).stem
+            
+            # Get all paragraph text
             for paragraph in doc.paragraphs:
                 if paragraph.text.strip():
                     text_parts.append(paragraph.text)
@@ -49,10 +124,11 @@ class PharmaQASearcher:
                         if cell.text.strip():
                             text_parts.append(cell.text)
             
-            return '\n'.join(text_parts)
+            body_text = '\n'.join(text_parts)
+            return title, body_text
         except Exception as e:
             st.error(f"Error reading {file_path}: {str(e)}")
-            return ""
+            return "", ""
     
     def extract_qa_pairs(self, text: str) -> List[Tuple[str, str]]:
         """
@@ -377,7 +453,7 @@ class PharmaQASearcher:
         return False  # Caching disabled to avoid pickle issues
     
     def index_documents(self, directory: str, file_pattern: str = "") -> int:
-        """Index all Word Q&A documents in a directory"""
+        """Index all Word Q&A documents in a directory with title weighting"""
         self.documents = []
         directory_path = Path(directory)
         
@@ -402,8 +478,8 @@ class PharmaQASearcher:
         for idx, file_path in enumerate(files):
             status_text.text(f"Processing: {file_path.name} ({idx+1}/{len(files)})")
             
-            # Extract text
-            text = self.extract_text_from_docx(str(file_path))
+            # Extract text and title
+            title, text = self.extract_text_from_docx(str(file_path))
             
             if not text.strip():
                 st.warning(f"No text extracted from {file_path.name}")
@@ -423,6 +499,7 @@ class PharmaQASearcher:
                 file_path=str(file_path),
                 file_modified_date=file_modified.strftime('%Y-%m-%d'),
                 word_count=word_count,
+                title=title,
                 qa_pairs=qa_pairs if qa_pairs else None
             )
             
@@ -435,12 +512,27 @@ class PharmaQASearcher:
             status_text.empty()
             return 0
         
-        status_text.text("Creating document embeddings...")
+        status_text.text("Creating document embeddings with optimized weighting...")
         
-        # Create embeddings for entire documents
-        document_texts = [doc.full_text for doc in self.documents]
+        # Create embeddings with improved weighting strategy:
+        # - Title: 2x (reduced from 3x to reduce over-emphasis)
+        # - Filename keywords: 2x (boost relevant terms from filename)
+        # - Body: 1x with drug names filtered (reduce drug name pollution)
+        weighted_texts = []
+        for doc in self.documents:
+            # Extract keywords from filename
+            filename_keywords = extract_filename_keywords(doc.filename)
+            filename_text = ' '.join(filename_keywords)
+            
+            # Filter excessive drug name mentions from body
+            filtered_body = filter_drug_names(doc.full_text)
+            
+            # Construct weighted text: Title 2x + Filename 2x + Filtered Body 1x
+            weighted_text = f"{doc.title}. {doc.title}. {filename_text}. {filename_text}. {filtered_body}"
+            weighted_texts.append(weighted_text)
+        
         embeddings = self.model.encode(
-            document_texts, 
+            weighted_texts, 
             show_progress_bar=True, 
             batch_size=8,
             convert_to_numpy=True
@@ -460,12 +552,15 @@ class PharmaQASearcher:
         return len(self.documents)
     
     def search(self, query: str, top_k: int = 5, min_score: float = 0.0) -> List[Tuple[QADocument, float]]:
-        """Search for most relevant Q&A documents"""
+        """Search for most relevant Q&A documents with synonym expansion"""
         if self.index is None or len(self.documents) == 0:
             return []
         
+        # Expand query with pharma-specific synonyms
+        expanded_query = expand_query_with_synonyms(query)
+        
         # Encode query
-        query_embedding = self.model.encode([query], convert_to_numpy=True)
+        query_embedding = self.model.encode([expanded_query], convert_to_numpy=True)
         faiss.normalize_L2(query_embedding)
         
         # Search
@@ -574,8 +669,93 @@ PATIENT_FRIENDLY_TERMS = {
     'half-life': 'how long the medicine stays in your body',
     'clinical trial': 'research study',
     'clinical endpoint': 'study result',
-    'prophylaxis': 'prevention'
+    'prophylaxis': 'prevention',
+    'discontinue': 'stop taking',
+    'discontinuing': 'stopping',
+    'taper': 'reduce gradually',
+    'tapering': 'reducing gradually'
 }
+
+# Pharma abbreviations (expand during search)
+PHARMA_ABBREVIATIONS = {
+    'moa': 'mechanism of action',
+    'pk': 'pharmacokinetics',
+    'pd': 'pharmacodynamics',
+    'pkpd': 'pharmacokinetics pharmacodynamics',
+    'ddi': 'drug drug interaction',
+    'ddis': 'drug drug interactions',
+    'ae': 'adverse event',
+    'aes': 'adverse events',
+    'sae': 'serious adverse event',
+    'saes': 'serious adverse events',
+    'peds': 'pediatric children',
+    'gi': 'gastrointestinal',
+    'cv': 'cardiovascular cardiac heart',
+    'cns': 'central nervous system',
+    'adme': 'absorption distribution metabolism excretion'
+}
+
+# Pharma-specific synonyms for search expansion (based on sample documents)
+PHARMA_SYNONYMS = {
+    'storage': ['storage', 'store', 'storing', 'stored', 'keep', 'kept', 'keeping', 'transport', 'transportation', 'shipping', 'ship'],
+    'transport': ['transport', 'transportation', 'shipping', 'ship', 'shipped', 'delivery', 'transit', 'storage', 'store'],
+    'stability': ['stability', 'stable', 'shelf life', 'expiry', 'expiration', 'storage conditions'],
+    'cold chain': ['cold chain', 'refrigerated', 'refrigeration', 'temperature controlled', 'temperature', 'cooling'],
+    'discontinue': ['discontinue', 'discontinuing', 'stop', 'stopping', 'cease', 'withdraw', 'withdrawal', 'taper', 'tapering'],
+    'stop': ['stop', 'stopping', 'discontinue', 'discontinuing', 'cease', 'withdraw', 'taper', 'tapering'],
+    'taper': ['taper', 'tapering', 'reduce gradually', 'wean', 'weaning', 'discontinue', 'stop gradually'],
+    'dose': ['dose', 'dosage', 'dosing', 'amount', 'quantity', 'regimen'],
+    'excipient': ['excipient', 'excipients', 'inactive ingredient', 'inactive ingredients'],
+    'formulation': ['formulation', 'formulated', 'formula', 'composition'],
+    'indication': ['indication', 'indicated', 'approved for', 'licensed for', 'use'],
+    'administration': ['administration', 'administer', 'give', 'take', 'taking', 'dosing'],
+    'adverse event': ['adverse event', 'adverse reaction', 'side effect', 'undesirable effect', 'safety'],
+}
+
+def clean_query(query: str) -> str:
+    """Remove common words that pollute search results"""
+    # Remove common question starters that don't add semantic value
+    stop_patterns = [
+        r'^\s*are\s+there\s+any\s+',
+        r'^\s*is\s+there\s+any\s+',
+        r'^\s*does\s+\w+\s+have\s+any\s+',
+        r'^\s*do\s+\w+\s+have\s+any\s+',
+    ]
+    
+    cleaned = query
+    for pattern in stop_patterns:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+    
+    return cleaned.strip()
+
+def expand_query_with_synonyms(query: str) -> str:
+    """
+    Expand query with pharma-specific synonyms and abbreviations
+    """
+    # First clean the query
+    query = clean_query(query)
+    
+    query_lower = query.lower()
+    expanded_terms = [query]
+    
+    # Expand abbreviations FIRST
+    for abbrev, full in PHARMA_ABBREVIATIONS.items():
+        if re.search(r'\b' + abbrev + r'\b', query_lower):
+            expanded_terms.append(full)
+    
+    # Then add synonyms
+    for key, synonyms in PHARMA_SYNONYMS.items():
+        # If any synonym appears in query, add related terms
+        if any(syn in query_lower for syn in synonyms):
+            # Add up to 2 most relevant synonyms not already in query
+            added = 0
+            for syn in synonyms[:4]:
+                if syn not in query_lower and added < 2:
+                    expanded_terms.append(syn)
+                    added += 1
+    
+    # Join with spaces and return
+    return ' '.join(expanded_terms)
 
 def detect_query_audience(query: str) -> str:
     """
@@ -714,6 +894,12 @@ def main():
             
             **Semantic Matching**: Uses sentence-level similarity for ranking.
             Enhanced highlighting catches variations like "study/studied/studies".
+            
+            **New Features**:
+            - 🎯 Title 2x + Filename keywords 2x + Filtered body
+            - 🔤 Abbreviations: "MOA" → "mechanism of action", "DDI" → "drug drug interaction"
+            - 🔗 Pharma synonyms: "storage" ↔ "transport", "discontinue" ↔ "stop/taper"
+            - 🧹 Query cleaning: Removes "are there any", "does X have" for better matching
             """)
         
         # Initialize model
@@ -913,6 +1099,8 @@ def main():
             with st.expander("📄 Indexed Documents"):
                 for doc in st.session_state.searcher.documents:
                     st.markdown(f"**{doc.filename}**")
+                    if doc.title:
+                        st.caption(f"📋 Title: {doc.title}")
                     st.caption(f"Modified: {doc.file_modified_date} | Words: {doc.word_count:,}")
                     if doc.qa_pairs:
                         st.caption(f"Q&A Pairs detected: {len(doc.qa_pairs)}")
@@ -960,7 +1148,7 @@ def main():
                 query = st.text_area(
                     "Enter your query:",
                     value=initial_value,
-                    placeholder="Example: What is the approved indication for [drug name]?\nExample: What are the side effects?",
+                    placeholder="Example: How to transport vamorolone?\nExample: How to discontinue treatment?",
                     height=100,
                     label_visibility="collapsed"
                 )
@@ -1046,6 +1234,9 @@ def main():
                     
                     with col1:
                         st.markdown(f"### {idx}. {doc.filename}")
+                        # Show title if available and different from filename
+                        if doc.title and doc.title != Path(doc.filename).stem:
+                            st.caption(f"📋 {doc.title}")
                     with col2:
                         st.markdown(f"<div style='text-align: right; padding-top: 10px;'>{indicator}<br><span style='color: {color}; font-size: 20px; font-weight: bold;'>{score:.1%}</span></div>", unsafe_allow_html=True)
                     
@@ -1162,6 +1353,8 @@ def main():
                 
                 for idx, (doc, score) in enumerate(results, 1):
                     export_text += f"{idx}. {doc.filename}\n"
+                    if doc.title:
+                        export_text += f"   Title: {doc.title}\n"
                     export_text += f"   Relevance: {score:.2%}\n"
                     export_text += f"   Modified: {doc.file_modified_date}\n"
                     export_text += f"   Path: {doc.file_path}\n"
@@ -1216,6 +1409,10 @@ def main():
             
             - 🧠 **Semantic Search** - Understands meaning, not just keywords
             - 💊 **Medical Domain** - Trained on pharmaceutical literature
+            - 🎯 **Smart Weighting** - Title 2x, Filename keywords 2x, Body 1x
+            - 🔤 **Abbreviation Expansion** - "MOA" → "mechanism of action"
+            - 🔗 **Pharma Synonyms** - "storage" ↔ "transport", "DDI" → "drug interactions"
+            - 🧹 **Query Cleaning** - Removes noise words like "are there any"
             - 🔍 **Enhanced Highlighting** - Catches variations and stems
             - 💡 **Example Questions** - 30+ pre-written HCP and patient questions
             - 🏥 **Patient Mode** - Auto-simplifies medical jargon for patients
@@ -1229,29 +1426,33 @@ def main():
         
         with col2:
             st.markdown("""
-            ### 💡 Example Question Categories
+            ### 💡 Example Queries
             
-            **👨‍⚕️ For Healthcare Professionals:**
-            - Indication & Mechanism (2 questions)
-            - Efficacy & Clinical Data (3 questions)
-            - Drug Interactions & Monitoring (3 questions)
-            - Pharmacology (3 questions)
+            **Now Handles:**
+            - "what is the MOA of vamorolone?" → expands to "mechanism of action"
+            - "are there any DDIs?" → expands to "drug drug interactions"
+            - "are there any effects on bone health?" → removes "are there any"
+            - "data in peds" → expands to "pediatric children"
             
-            **🏥 For Patients/Caregivers:**
-            - Safety & Adverse Events (4 questions)
-            - Special Populations (3 questions)
-            - Dosing & Administration (4 questions)
-            - Practical Information (3 questions)
+            **Storage & Transport:**
+            - "How to transport vamorolone?"
+            - "Storage conditions for the medication"
             
-            ### 🔄 Language Simplification
+            **Discontinuing Treatment:**
+            - "How to stop treatment?"
+            - "Tapering schedule"
             
-            **Patient Mode automatically replaces:**
-            - "adverse events" → "side effects"
-            - "contraindications" → "reasons you should not take this"
-            - "hepatic" → "liver"
-            - "renal" → "kidney"
-            - "efficacy" → "how well it works"
-            - And 15+ more medical terms!
+            ### 🔗 Smart Features
+            
+            **Abbreviation expansion:**
+            - MOA → mechanism of action
+            - DDI → drug drug interaction  
+            - PK/PD → pharmacokinetics/pharmacodynamics
+            - Peds → pediatric children
+            
+            **Filename boosting:**
+            - "Cardiac_Effects" in filename → boosts for "cardiac" or "heart" queries
+            - "Bone_Health" → boosts for "bone" queries
             """)
         
         st.markdown("---")
